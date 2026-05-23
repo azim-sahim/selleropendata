@@ -352,6 +352,8 @@ async def save_orders(session: AsyncSession, orders_data: List[dict]) -> int:
     """
     saved_count = 0
     
+        # Извлекаем финансовые данные из заказа (если есть)
+        financials = order_data.get("financials", {})
     for order_data in orders_data:
         try:
             order, created = await get_or_create(

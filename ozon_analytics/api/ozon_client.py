@@ -7,12 +7,13 @@
 - Exponential backoff при ошибках 429/5xx
 - Pagination для больших ответов
 - Логирование всех запросов
+- Получение фактических комиссий, логистики и эквайринга из API
 """
 
 import asyncio
 import logging
 from typing import Any, Dict, List, Optional, TypeVar, Generic
-from datetime import datetime
+from datetime import datetime, date, timedelta
 import httpx
 from tenacity import (
     retry,
@@ -59,28 +60,36 @@ class OzonClient:
     - Exponential backoff при временных ошибках
     - Поддержка pagination
     - Детальное логирование
+    - Получение фактических комиссий и сборов из API
     """
     
     BASE_URL = "https://api-seller.ozon.ru"
     
-    # Endpoints Products
+    # === Products Endpoints ===
     ENDPOINT_PRODUCT_LIST = "/v2/product/list"
     ENDPOINT_PRODUCT_INFO = "/v2/product/info"
-    ENDPOINT_PRODUCT_INFO_BY_SKU = "/v2/product/info/{sku}"
+    ENDPOINT_PRODUCT_PRICES = "/v2/prices/info"
     
-    # Endpoints Orders (FBS)
+    # === Orders Endpoints (FBS/FBO) ===
     ENDPOINT_POSTING_UNFULFILLED = "/v2/posting/fbs/unfulfilled"
     ENDPOINT_POSTING_DELIVERED = "/v2/posting/fbs/delivered"
     ENDPOINT_POSTING_GET = "/v1/posting/fbs/get"
+    ENDPOINT_POSTING_FBO_GET = "/v3/posting/fbo/get"
     
-    # Endpoints Finance
+    # === Finance Endpoints ===
     ENDPOINT_CASH_FLOW = "/v1/finance/cash-flow-statement"
     ENDPOINT_ANALYTICS_DATA = "/v2/analytics/data"
+    ENDPOINT_FINANCE_TRANSACTIONS = "/v1/finance/transaction-list"
+    ENDPOINT_FINANCIAL_DETAILS = "/v2/finance/operation-details"
     
-    # Endpoints Advertising
+    # === Advertising Endpoints ===
     ENDPOINT_CAMPAIGN_LIST = "/v1/campaign/list"
     ENDPOINT_CAMPAIGN_STATS = "/v1/campaign/{campaign_id}/stats"
     ENDPOINT_ADS_STATS = "/v1/ads/{ads_id}/stats"
+    
+    # === Reports Endpoints (для детализации комиссий) ===
+    ENDPOINT_REPORTS_LIST = "/v1/reports/list"
+    ENDPOINT_REPORTS_DOWNLOAD = "/v1/reports/download/{report_id}"
     
     def __init__(self):
         self.client_id = config.ozon_client_id
@@ -461,6 +470,136 @@ class OzonClient:
         """
         json_data = {"posting_number": posting_number}
         return await self.request("POST", self.ENDPOINT_POSTING_GET, json_data=json_data)
+    async def get_fbo_order_details(self, posting_number: str) -> Dict[str, Any]:
+        """
+        Получить детали заказа FBO по номеру.
+
+        Endpoint: /v3/posting/fbo/get
+
+        Args:
+            posting_number: Номер заказа FBO
+
+        Returns:
+            Детали заказа FBO
+        """
+        json_data = {"posting_number": posting_number}
+        return await self.request("POST", self.ENDPOINT_POSTING_FBO_GET, json_data=json_data)
+
+    async def get_financial_operation_details(
+        self,
+        posting_number: str,
+        operation_type: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Получить детализацию финансовых операций по заказу.
+
+        Endpoint: /v2/finance/operation-details
+        
+        Это основной endpoint для получения реальных комиссий!
+        
+        Возвращает детальную информацию по всем начислениям и удержаниям:
+        - Продажа товара (выручка)
+        - Комиссия Ozon (по категории товара)
+        - Логистика (базовая + за кг)
+        - Эквайринг (2%)
+        - Обработка возврата
+        - Штрафы
+        - Прочие удержания
+
+        Args:
+            posting_number: Номер заказа
+            operation_type: Тип операции (опционально)
+
+        Returns:
+            Список финансовых операций с деталями
+        """
+        json_data = {
+            "posting_number": posting_number,
+        }
+        if operation_type:
+            json_data["operation_type"] = operation_type
+        
+        response = await self.request("POST", self.ENDPOINT_FINANCIAL_DETAILS, json_data=json_data)
+        return response.get("result", {}).get("operations", [])
+
+    async def get_finance_transactions(
+        self,
+        date_from: datetime,
+        date_to: datetime,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> Dict[str, Any]:
+        """
+        Получить список финансовых транзакций.
+
+        Endpoint: /v1/finance/transaction-list
+
+        Args:
+            date_from: Начальная дата
+            date_to: Конечная дата
+            limit: Лимит записей
+            offset: Смещение
+
+        Returns:
+            Список транзакций
+        """
+        json_data = {
+            "date": {
+                "from": date_from.strftime("%Y-%m-%d"),
+                "to": date_to.strftime("%Y-%m-%d")
+            },
+            "limit": limit,
+            "offset": offset,
+        }
+        return await self.request("POST", self.ENDPOINT_FINANCE_TRANSACTIONS, json_data=json_data)
+
+    async def get_all_finance_transactions(
+        self,
+        date_from: datetime,
+        date_to: datetime,
+        max_pages: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """
+        Получить все финансовые транзакции за период с pagination.
+
+        Args:
+            date_from: Начальная дата
+            date_to: Конечная дата
+            max_pages: Максимум страниц
+
+        Returns:
+            Список всех транзакций
+        """
+        all_transactions = []
+        offset = 0
+        limit = 100
+        page = 0
+        
+        while page < max_pages:
+            response = await self.get_finance_transactions(
+                date_from=date_from,
+                date_to=date_to,
+                limit=limit,
+                offset=offset,
+            )
+            
+            operations = response.get("result", {}).get("operations", [])
+            if not operations:
+                break
+            
+            all_transactions.extend(operations)
+            logger.info(f"Загружено {len(operations)} транзакций на странице {page + 1}, всего: {len(all_transactions)}")
+            
+            # Проверка на последнюю страницу
+            if len(operations) < limit:
+                break
+            
+            offset += limit
+            page += 1
+            await asyncio.sleep(0.1)
+        
+        return all_transactions
+
     
     # === Finance Methods ===
     
