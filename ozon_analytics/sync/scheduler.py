@@ -230,6 +230,9 @@ class SyncScheduler:
         """
         Синхронизировать финансовые операции из Ozon API.
         
+        ВАЖНО: Здесь загружаются детальные финансовые операции по каждому заказу
+        через endpoint /v2/finance/operation-details для точного расчета комиссий.
+        
         Args:
             days_back: За сколько дней загружать данные
             
@@ -246,17 +249,54 @@ class SyncScheduler:
             date_from = date_to - timedelta(days=days_back)
             
             async with db_manager.get_session() as session:
-                # Cash flow statement
+                # 1. Сначала получаем список заказов за период
+                orders_data = await ozon_client.get_delivered_orders(
+                    since=date_from,
+                    limit=500,  # Берем больше заказов
+                )
+                
+                all_operations = []
+                posting_numbers = set()
+                
+                # 2. Для каждого заказа получаем детализацию финансовых операций
+                # Это ключевой момент для получения реальных комиссий!
+                for order in orders_data:
+                    posting_number = order.get("posting_number")
+                    if not posting_number or posting_number in posting_numbers:
+                        continue
+                    
+                    posting_numbers.add(posting_number)
+                    
+                    try:
+                        # Получаем детальную финансовую информацию по заказу
+                        # Endpoint: /v2/finance/operation-details
+                        operations = await ozon_client.get_financial_operation_details(
+                            posting_number=posting_number,
+                        )
+                        
+                        if operations:
+                            all_operations.extend(operations)
+                            logger.debug(f"Загружено {len(operations)} операций для заказа {posting_number}")
+                        
+                        # Небольшая пауза для соблюдения rate limits
+                        await asyncio.sleep(0.05)
+                        
+                    except Exception as e:
+                        logger.warning(f"Не удалось получить детали для заказа {posting_number}: {e}")
+                        continue
+                
+                logger.info(f"Всего загружено {len(all_operations)} финансовых операций")
+                
+                # 3. Сохраняем в БД
+                if all_operations:
+                    from storage.db import save_finance_operations
+                    stats["loaded"] = await save_finance_operations(session, all_operations)
+                
+                # Также сохраняем общий cash flow statement для сверки
                 cash_flow_data = await ozon_client.get_cash_flow_statement(
                     date_from=date_from,
                     date_to=date_to,
                 )
-                
-                operations = cash_flow_data.get("operations", [])
-                
-                if operations:
-                    from storage.db import save_finance_operations
-                    stats["loaded"] = await save_finance_operations(session, operations)
                 
                 # Лог синхронизации
                 await save_sync_log(
@@ -264,7 +304,7 @@ class SyncScheduler:
                     "finance",
                     "success" if stats["loaded"] > 0 else "partial",
                     records_loaded=stats["loaded"],
-                    last_successful_date=date_to.date(),
+                    last_successful_date=date.today(),
                 )
                 
                 logger.info(f"Синхронизировано {stats['loaded']} финансовых операций")
