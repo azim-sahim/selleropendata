@@ -1,4 +1,7 @@
 ```
+# Database files
+*.db
+
 # Python
 __pycache__/
 *.pyc
@@ -12,30 +15,18 @@ venv/
 .python-version
 pip-log.txt
 pip-delete-this-directory.txt
-.tox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.log
 .pytest_cache/
 .mypy_cache/
 
-# Environment
-.env
-.env.local
-.env.*
-
 # Logs
-logs/
 *.log
 
-# Database
-*.db
-
-# OS
+# OS generated files
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
 Thumbs.db
 ```
